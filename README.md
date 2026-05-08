@@ -41,3 +41,12 @@ Then open `http://localhost:3000`.
 ## Deploy
 
 Deploy the folder to Vercel using the Next.js framework preset. No database, queue, or persistent server is required.
+
+If Vercel says `No Output Directory named "public" found`, clear the old static-site setting:
+
+- Project Settings -> Build and Development Settings
+- Framework Preset: `Next.js`
+- Output Directory: remove `public` / leave empty
+- Redeploy
+
+The repo also sets `"framework": "nextjs"` and `"outputDirectory": null` in `vercel.json` so new deployments should use the Next.js defaults.
