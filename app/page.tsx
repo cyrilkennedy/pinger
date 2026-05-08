@@ -6,6 +6,11 @@ import { monitoredServices, type MonitoredService } from "@/lib/services";
 const DEFAULT_SLOW_THRESHOLD_MS = 1000;
 const LOG_LIMIT = 20;
 const LOG_PREFIX = "pinger:logs:";
+const LAST_PING_PREFIX = "pinger:last-ping:";
+const IN_FLIGHT_PREFIX = "pinger:in-flight:";
+const PAUSED_PREFIX = "pinger:paused:";
+const GLOBAL_PAUSED_KEY = "pinger:paused:global";
+const IN_FLIGHT_TIMEOUT_MS = 30000;
 const TICK_MS = 1000;
 
 type BrowserPingResult = {
@@ -38,6 +43,18 @@ function serviceKey(service: MonitoredService) {
 
 function logKey(service: MonitoredService) {
   return `${LOG_PREFIX}${serviceKey(service)}`;
+}
+
+function lastPingKey(service: MonitoredService) {
+  return `${LAST_PING_PREFIX}${serviceKey(service)}`;
+}
+
+function inFlightKey(service: MonitoredService) {
+  return `${IN_FLIGHT_PREFIX}${serviceKey(service)}`;
+}
+
+function pausedKey(service: MonitoredService) {
+  return `${PAUSED_PREFIX}${serviceKey(service)}`;
 }
 
 function formatLatency(value: number) {
@@ -80,6 +97,63 @@ function saveLogs(service: MonitoredService, logs: LogEntry[]) {
     localStorage.setItem(logKey(service), JSON.stringify(logs.slice(0, LOG_LIMIT)));
   } catch {
     // Private or restricted browsers can block storage; status checks should still work.
+  }
+}
+
+function readStoredNumber(key: string) {
+  if (typeof window === "undefined") return null;
+
+  const value = Number(localStorage.getItem(key));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function saveLastPingTime(service: MonitoredService, timestamp: number) {
+  try {
+    localStorage.setItem(lastPingKey(service), String(timestamp));
+  } catch {
+    // Timing memory is best-effort; the in-page scheduler still works.
+  }
+}
+
+function loadLastPingTimes() {
+  const times = new Map<string, number>();
+
+  for (const service of monitoredServices) {
+    const timestamp = readStoredNumber(lastPingKey(service));
+    if (timestamp) times.set(serviceKey(service), timestamp);
+  }
+
+  return times;
+}
+
+function isGlobalPaused() {
+  if (typeof window === "undefined") return false;
+  return localStorage.getItem(GLOBAL_PAUSED_KEY) === "true";
+}
+
+function isServicePaused(service: MonitoredService) {
+  if (typeof window === "undefined") return false;
+  return localStorage.getItem(pausedKey(service)) === "true";
+}
+
+function hasFreshInFlightLock(service: MonitoredService, timestamp: number) {
+  const lockedAt = readStoredNumber(inFlightKey(service));
+  return Boolean(lockedAt && timestamp - lockedAt < IN_FLIGHT_TIMEOUT_MS);
+}
+
+function lockService(service: MonitoredService, timestamp: number) {
+  try {
+    localStorage.setItem(inFlightKey(service), String(timestamp));
+  } catch {
+    // If storage is blocked, only this tab's in-memory run guard applies.
+  }
+}
+
+function unlockService(service: MonitoredService) {
+  try {
+    localStorage.removeItem(inFlightKey(service));
+  } catch {
+    // Ignore storage failures.
   }
 }
 
@@ -134,6 +208,8 @@ export default function StatusPage() {
   const [logsVersion, setLogsVersion] = useState(0);
   const [lastChecked, setLastChecked] = useState("Starting now");
   const [lastPingTimes, setLastPingTimes] = useState<Map<string, number>>(new Map());
+  const [pausedVersion, setPausedVersion] = useState(0);
+  const [globalPaused, setGlobalPaused] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const currentRun = useRef(0);
   const resultsRef = useRef(new Map<string, BrowserPingResult>());
@@ -149,7 +225,17 @@ export default function StatusPage() {
 
   const refresh = useCallback(async (mode: "all" | "due" = "due") => {
     const timestamp = Date.now();
+    if (isGlobalPaused()) return;
+
+    const storedTimes = loadLastPingTimes();
+    if (storedTimes.size) {
+      lastPingTimesRef.current = new Map([...lastPingTimesRef.current, ...storedTimes]);
+      setLastPingTimes(lastPingTimesRef.current);
+    }
+
     const servicesToPing = monitoredServices.filter((service) => {
+      if (isServicePaused(service)) return false;
+      if (hasFreshInFlightLock(service, timestamp)) return false;
       if (mode === "all") return true;
 
       const key = serviceKey(service);
@@ -163,39 +249,55 @@ export default function StatusPage() {
 
     const runId = currentRun.current + 1;
     currentRun.current = runId;
-
-    const settled = await Promise.all(servicesToPing.map((service) => ping(service, runId, () => currentRun.current)));
-    if (runId !== currentRun.current) return;
-
-    const nextResults = new Map(resultsRef.current);
-    const nextPingTimes = new Map(lastPingTimesRef.current);
-
-    for (const result of settled) {
-      if (result) nextResults.set(result.key, result);
-    }
-
     for (const service of servicesToPing) {
-      const result = nextResults.get(serviceKey(service));
-      if (!result) continue;
-
-      saveLogs(service, [buildLogEntry(service, result), ...loadLogs(service)].slice(0, LOG_LIMIT));
-      nextPingTimes.set(serviceKey(service), Date.now());
+      lockService(service, timestamp);
     }
 
-    lastPingTimesRef.current = nextPingTimes;
-    resultsRef.current = nextResults;
-    setResults(nextResults);
-    setLastPingTimes(nextPingTimes);
-    setLogsVersion((version) => version + 1);
-    setLastChecked(`Checked ${new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
-    })}`);
+    try {
+      const settled = await Promise.all(servicesToPing.map((service) => ping(service, runId, () => currentRun.current)));
+      if (runId !== currentRun.current) return;
+
+      const nextResults = new Map(resultsRef.current);
+      const nextPingTimes = new Map(lastPingTimesRef.current);
+
+      for (const result of settled) {
+        if (result) nextResults.set(result.key, result);
+      }
+
+      for (const service of servicesToPing) {
+        const result = nextResults.get(serviceKey(service));
+        if (!result) continue;
+
+        saveLogs(service, [buildLogEntry(service, result), ...loadLogs(service)].slice(0, LOG_LIMIT));
+        const completedAt = Date.now();
+        saveLastPingTime(service, completedAt);
+        nextPingTimes.set(serviceKey(service), completedAt);
+      }
+
+      lastPingTimesRef.current = nextPingTimes;
+      resultsRef.current = nextResults;
+      setResults(nextResults);
+      setLastPingTimes(nextPingTimes);
+      setLogsVersion((version) => version + 1);
+      setLastChecked(`Checked ${new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      })}`);
+    } finally {
+      for (const service of servicesToPing) {
+        unlockService(service);
+      }
+    }
   }, []);
 
   useEffect(() => {
-    void refresh("all");
+    const storedTimes = loadLastPingTimes();
+    lastPingTimesRef.current = storedTimes;
+    setLastPingTimes(storedTimes);
+    setGlobalPaused(isGlobalPaused());
+    setPausedVersion((version) => version + 1);
+    void refresh("due");
   }, [refresh]);
 
   useEffect(() => {
@@ -230,6 +332,19 @@ export default function StatusPage() {
     setLogsVersion((version) => version + 1);
   }
 
+  function toggleGlobalPaused() {
+    const nextPaused = !globalPaused;
+    localStorage.setItem(GLOBAL_PAUSED_KEY, String(nextPaused));
+    setGlobalPaused(nextPaused);
+    setPausedVersion((version) => version + 1);
+  }
+
+  function toggleServicePaused(service: MonitoredService) {
+    const nextPaused = !isServicePaused(service);
+    localStorage.setItem(pausedKey(service), String(nextPaused));
+    setPausedVersion((version) => version + 1);
+  }
+
   return (
     <main className="shell">
       <header className="hero">
@@ -241,6 +356,9 @@ export default function StatusPage() {
         <div className="summary" aria-live="polite">
           <span id="summaryText">{summary}</span>
           <span>{lastChecked}</span>
+          <button className={`pause-all ${globalPaused ? "paused" : ""}`} type="button" onClick={toggleGlobalPaused}>
+            {globalPaused ? "Resume all" : "Pause all"}
+          </button>
         </div>
       </header>
 
@@ -281,7 +399,8 @@ export default function StatusPage() {
                 const lastPingAt = lastPingTimes.get(key);
                 const intervalMs = Math.max(1, service.intervalMinutes) * 60 * 1000;
                 const nextPingAt = lastPingAt ? lastPingAt + intervalMs : now;
-                const nextPingText = lastPingAt ? formatDuration(nextPingAt - now) : "now";
+                const servicePaused = isServicePaused(service);
+                const nextPingText = globalPaused || servicePaused ? "Paused" : lastPingAt ? formatDuration(nextPingAt - now) : "now";
                 const lastPingText = lastPingAt
                   ? new Date(lastPingAt).toLocaleTimeString([], {
                     hour: "2-digit",
@@ -292,7 +411,7 @@ export default function StatusPage() {
 
                 return (
                   <article className="service" key={key}>
-                    <div className={`service-accent ${status.className}`}></div>
+                    <div className={`service-accent ${servicePaused ? "paused" : status.className}`}></div>
                     <div className="service-summary">
                       <div className="service-main">
                         <h3 className="service-name">{service.name}</h3>
@@ -301,9 +420,10 @@ export default function StatusPage() {
                           <span>{code}</span>
                           <span>{latency}</span>
                           <span>Every {service.intervalMinutes}m</span>
+                          {servicePaused ? <span>Paused</span> : null}
                         </div>
                       </div>
-                      <span className={`status ${status.className}`}>{status.label}</span>
+                      <span className={`status ${servicePaused ? "paused" : status.className}`}>{servicePaused ? "Paused" : status.label}</span>
                     </div>
 
                     <div className="service-metrics" aria-label={`${service.name} ping timing`}>
@@ -324,9 +444,14 @@ export default function StatusPage() {
                     <div className="service-logs">
                       <div className="log-header">
                         <span>Ping logs <small>latest {LOG_LIMIT}</small></span>
-                        <button className="clear-logs" type="button" onClick={() => clearLogs(service)}>Clear logs</button>
+                        <div className="log-actions">
+                          <button className="clear-logs" type="button" onClick={() => toggleServicePaused(service)}>
+                            {servicePaused ? "Resume" : "Pause"}
+                          </button>
+                          <button className="clear-logs" type="button" onClick={() => clearLogs(service)}>Clear logs</button>
+                        </div>
                       </div>
-                      <ul className="log-list" data-version={logsVersion}>
+                      <ul className="log-list" data-version={`${logsVersion}-${pausedVersion}`}>
                         {logs.length ? logs.map((entry) => (
                           <li className="log-row" key={`${entry.timestamp}-${entry.code}-${entry.latency}`}>
                             <span className={`log-dot ${entry.className}`}></span>
