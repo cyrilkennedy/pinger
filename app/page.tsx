@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { monitoredServices, type MonitoredService } from "@/lib/services";
 
-const REFRESH_MS = 60000;
 const DEFAULT_SLOW_THRESHOLD_MS = 1000;
 const LOG_LIMIT = 20;
 const LOG_PREFIX = "pinger:logs:";
+const TICK_MS = 1000;
 
 type BrowserPingResult = {
   key: string;
@@ -43,6 +43,17 @@ function logKey(service: MonitoredService) {
 function formatLatency(value: number) {
   if (!Number.isFinite(value)) return "No response";
   return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
+}
+
+function formatDuration(ms: number) {
+  if (ms <= 0) return "now";
+
+  const totalSeconds = Math.ceil(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
 }
 
 function getStatus(result: BrowserPingResult | undefined, service: MonitoredService): StatusInfo {
@@ -122,7 +133,11 @@ export default function StatusPage() {
   const [results, setResults] = useState<Map<string, BrowserPingResult>>(new Map());
   const [logsVersion, setLogsVersion] = useState(0);
   const [lastChecked, setLastChecked] = useState("Starting now");
+  const [lastPingTimes, setLastPingTimes] = useState<Map<string, number>>(new Map());
+  const [now, setNow] = useState(() => Date.now());
   const currentRun = useRef(0);
+  const resultsRef = useRef(new Map<string, BrowserPingResult>());
+  const lastPingTimesRef = useRef(new Map<string, number>());
 
   const groupedServices = useMemo(() => {
     return monitoredServices.reduce((groups, service) => {
@@ -132,28 +147,45 @@ export default function StatusPage() {
     }, new Map<string, MonitoredService[]>());
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (mode: "all" | "due" = "due") => {
+    const timestamp = Date.now();
+    const servicesToPing = monitoredServices.filter((service) => {
+      if (mode === "all") return true;
+
+      const key = serviceKey(service);
+      const lastPingAt = lastPingTimesRef.current.get(key);
+      const intervalMs = Math.max(1, service.intervalMinutes) * 60 * 1000;
+
+      return !lastPingAt || timestamp - lastPingAt >= intervalMs;
+    });
+
+    if (!servicesToPing.length) return;
+
     const runId = currentRun.current + 1;
     currentRun.current = runId;
-    setResults(new Map());
 
-    const settled = await Promise.all(monitoredServices.map((service) => ping(service, runId, () => currentRun.current)));
+    const settled = await Promise.all(servicesToPing.map((service) => ping(service, runId, () => currentRun.current)));
     if (runId !== currentRun.current) return;
 
-    const nextResults = new Map<string, BrowserPingResult>();
+    const nextResults = new Map(resultsRef.current);
+    const nextPingTimes = new Map(lastPingTimesRef.current);
 
     for (const result of settled) {
       if (result) nextResults.set(result.key, result);
     }
 
-    for (const service of monitoredServices) {
+    for (const service of servicesToPing) {
       const result = nextResults.get(serviceKey(service));
       if (!result) continue;
 
       saveLogs(service, [buildLogEntry(service, result), ...loadLogs(service)].slice(0, LOG_LIMIT));
+      nextPingTimes.set(serviceKey(service), Date.now());
     }
 
+    lastPingTimesRef.current = nextPingTimes;
+    resultsRef.current = nextResults;
     setResults(nextResults);
+    setLastPingTimes(nextPingTimes);
     setLogsVersion((version) => version + 1);
     setLastChecked(`Checked ${new Date().toLocaleTimeString([], {
       hour: "2-digit",
@@ -163,8 +195,15 @@ export default function StatusPage() {
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), REFRESH_MS);
+    void refresh("all");
+  }, [refresh]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+      void refresh("due");
+    }, TICK_MS);
+
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -176,6 +215,16 @@ export default function StatusPage() {
     return `${up} up, ${slow} slow, ${down} down`;
   }, [results]);
 
+  const stats = useMemo(() => {
+    const values = [...results.values()];
+    return {
+      total: monitoredServices.length,
+      up: values.filter((item) => item.ok && item.latencyMs <= item.slowThresholdMs).length,
+      slow: values.filter((item) => item.ok && item.latencyMs > item.slowThresholdMs).length,
+      down: values.filter((item) => !item.ok).length
+    };
+  }, [results]);
+
   function clearLogs(service: MonitoredService) {
     localStorage.removeItem(logKey(service));
     setLogsVersion((version) => version + 1);
@@ -183,16 +232,36 @@ export default function StatusPage() {
 
   return (
     <main className="shell">
-      <header className="topbar">
+      <header className="hero">
         <div>
           <p className="eyebrow">Live monitor</p>
           <h1>Service Status</h1>
+          <p className="hero-copy">Track uptime, latency, recent ping logs, and each service&apos;s next scheduled browser check.</p>
         </div>
         <div className="summary" aria-live="polite">
           <span id="summaryText">{summary}</span>
           <span>{lastChecked}</span>
         </div>
       </header>
+
+      <section className="stats" aria-label="Status summary">
+        <div className="stat">
+          <span className="stat-label">Services</span>
+          <strong>{stats.total}</strong>
+        </div>
+        <div className="stat">
+          <span className="stat-label">Healthy</span>
+          <strong>{stats.up}</strong>
+        </div>
+        <div className="stat">
+          <span className="stat-label">Slow</span>
+          <strong>{stats.slow}</strong>
+        </div>
+        <div className="stat">
+          <span className="stat-label">Down</span>
+          <strong>{stats.down}</strong>
+        </div>
+      </section>
 
       <section className="groups" aria-live="polite">
         {[...groupedServices.entries()].map(([project, services]) => (
@@ -209,9 +278,21 @@ export default function StatusPage() {
                 const code = result?.status ? `HTTP ${result.status}` : result?.note || "Waiting";
                 const latency = result ? formatLatency(result.latencyMs) : "Checking";
                 const logs = typeof window === "undefined" ? [] : loadLogs(service);
+                const lastPingAt = lastPingTimes.get(key);
+                const intervalMs = Math.max(1, service.intervalMinutes) * 60 * 1000;
+                const nextPingAt = lastPingAt ? lastPingAt + intervalMs : now;
+                const nextPingText = lastPingAt ? formatDuration(nextPingAt - now) : "now";
+                const lastPingText = lastPingAt
+                  ? new Date(lastPingAt).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit"
+                  })
+                  : "Not yet";
 
                 return (
                   <article className="service" key={key}>
+                    <div className={`service-accent ${status.className}`}></div>
                     <div className="service-summary">
                       <div className="service-main">
                         <h3 className="service-name">{service.name}</h3>
@@ -219,14 +300,30 @@ export default function StatusPage() {
                         <div className="meta">
                           <span>{code}</span>
                           <span>{latency}</span>
+                          <span>Every {service.intervalMinutes}m</span>
                         </div>
                       </div>
                       <span className={`status ${status.className}`}>{status.label}</span>
                     </div>
 
+                    <div className="service-metrics" aria-label={`${service.name} ping timing`}>
+                      <div>
+                        <span>Next ping</span>
+                        <strong>{nextPingText}</strong>
+                      </div>
+                      <div>
+                        <span>Last ping</span>
+                        <strong>{lastPingText}</strong>
+                      </div>
+                      <div>
+                        <span>Slow after</span>
+                        <strong>{formatLatency(service.slowThresholdMs)}</strong>
+                      </div>
+                    </div>
+
                     <div className="service-logs">
                       <div className="log-header">
-                        <span>Ping logs</span>
+                        <span>Ping logs <small>latest {LOG_LIMIT}</small></span>
                         <button className="clear-logs" type="button" onClick={() => clearLogs(service)}>Clear logs</button>
                       </div>
                       <ul className="log-list" data-version={logsVersion}>
